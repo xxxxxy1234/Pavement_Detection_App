@@ -1,0 +1,8 @@
+crack
+patched_crack
+pothole
+patched_pothole
+alligator_crack
+patched_alligator_crack
+manhole
+street_waste
