@@ -13,6 +13,11 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <com.example.collectdata.DetectionOverlayView
+        android:id="@+id/overlayView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
     <LinearLayout
         android:id="@+id/infoPanel"
         android:layout_width="match_parent"

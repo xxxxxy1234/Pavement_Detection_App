@@ -3,8 +3,11 @@ package com.example.collectdata
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.RectF
+import android.util.Log
 import org.tensorflow.lite.Interpreter
+import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
@@ -26,6 +29,7 @@ class YoloDetector(
 ) {
     private var interpreter: Interpreter? = null
     private var labels: List<String> = emptyList()
+    private val lock = Any()
 
     init {
         loadModel()
@@ -57,22 +61,44 @@ class YoloDetector(
     }
 
     // 核心推理函数，传入一帧 Bitmap，返回检测结果列表
+    // detect 函数整体用 synchronized 包裹
     fun detect(bitmap: Bitmap): List<DetectionResult> {
-        val resized = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
-        val inputBuffer = bitmapToByteBuffer(resized)
+        return synchronized(lock) {
+            val argbBitmap = if (bitmap.config == Bitmap.Config.ARGB_8888) {
+                bitmap
+            } else {
+                bitmap.copy(Bitmap.Config.ARGB_8888, false)
+            }
+            val resized = Bitmap.createScaledBitmap(argbBitmap, inputSize, inputSize, true)
+                .let {
+                    if (it.config == Bitmap.Config.ARGB_8888) it
+                    else it.copy(Bitmap.Config.ARGB_8888, false)
+                }
+            // ── 临时诊断：保存送入模型的图像 ──
+            val debugFile = File(context.getExternalFilesDir(null), "debug_input.jpg")
+            FileOutputStream(debugFile).use { resized.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+            Log.d("YOLO_DEBUG", "已保存推理帧到: ${debugFile.absolutePath}")
 
-        // 输出 shape: [1, 300, 6]
-        val output = Array(1) { Array(300) { FloatArray(6) } }
-        interpreter?.run(inputBuffer, output)
+            val inputBuffer = bitmapToByteBuffer(resized)
 
-        return parseOutput(output[0], bitmap.width.toFloat(), bitmap.height.toFloat())
+            val outputMap = HashMap<Int, Any>()
+            val output = Array(1) { Array(300) { FloatArray(6) } }
+            outputMap[0] = output
+            interpreter?.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputMap)
+
+            parseOutput(output[0], bitmap.width.toFloat(), bitmap.height.toFloat())
+            
+        }
     }
 
-    private fun parseOutput(
-        output: Array<FloatArray>,
-        origW: Float,
-        origH: Float
-    ): List<DetectionResult> {
+    private fun parseOutput(output: Array<FloatArray>, origW: Float, origH: Float): List<DetectionResult> {
+        // ── 诊断：打印置信度最高的5行原始数据 ──
+        val top5 = output.sortedByDescending { it[4] }.take(5)
+        top5.forEachIndexed { i, row ->
+            Log.d("YOLO_RAW", "top[$i]: [${row[0]}, ${row[1]}, ${row[2]}, ${row[3]}, conf=${row[4]}, cls=${row[5]}]")
+        }
+
+
         val results = mutableListOf<DetectionResult>()
 
         for (row in output) {
@@ -84,9 +110,7 @@ class YoloDetector(
             val conf = row[4]
             val cls  = row[5].toInt()
 
-            if (conf > 0.05f) {
-                android.util.Log.d("YOLO_RAW", "conf=${"%.3f".format(conf)}, cls=$cls, box=[${row[0]},${row[1]},${row[2]},${row[3]}]")
-            }
+
             if (conf < confThreshold) continue
 
 
@@ -118,12 +142,17 @@ class YoloDetector(
             buffer.putFloat(((pixel shr 8) and 0xFF) / 255.0f)  // G
             buffer.putFloat((pixel and 0xFF) / 255.0f)           // B
         }
+        buffer.rewind()
         return buffer
     }
 
 
 
+    // close 也要加锁
     fun close() {
-        interpreter?.close()
+        synchronized(lock) {
+            interpreter?.close()
+        }
     }
+
 }
