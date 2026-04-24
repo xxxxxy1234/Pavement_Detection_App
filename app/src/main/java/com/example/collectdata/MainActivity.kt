@@ -32,6 +32,7 @@ import java.io.FileOutputStream
 import java.io.FileWriter
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
 class MainActivity : AppCompatActivity(), SensorEventListener {
@@ -66,13 +67,18 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private var isRecording = false
     private var lastTriggerTime = 0L
-    private val COOL_DOWN_MS = 3000L          // 通道A冷却：3秒
+    private val COOL_DOWN_MS = 3000L
 
     // ── CameraX ───────────────────────────────────────────────────────────────
     private var videoCapture: VideoCapture<Recorder>? = null
     private var recording: Recording? = null
     // 帧缓冲保留60帧（约2秒@30fps），供通道A取前2秒画面
     private val frameBuffer = Collections.synchronizedList(mutableListOf<Bitmap>())
+
+    // ── 最新帧（用于推理完成后叠加到当前预览） ──────────────────────────────
+    // 用 volatile 保证线程可见性，始终持有最新一帧的尺寸
+    @Volatile private var latestFrameWidth = 1
+    @Volatile private var latestFrameHeight = 1
 
     // ── 文件流 & 位置 ─────────────────────────────────────────────────────────
     private var imuFileWriter: BufferedWriter? = null
@@ -85,10 +91,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     // 通道B（实时视频流检测）参数
     private var lastRealtimeDetectMs = 0L
-    private val REALTIME_INTERVAL_MS = 500L   // 每500ms推理一次
+    private val REALTIME_INTERVAL_MS = 200L   // 【修改】500ms → 200ms，响应更快
     private var lastChannelBSaveMs = 0L
-    private val CHANNEL_B_COOLDOWN_MS = 5000L // 通道B自动保存冷却：5秒
-    private var isDetecting = java.util.concurrent.atomic.AtomicBoolean(false) // 防止推理线程堆积
+    private val CHANNEL_B_COOLDOWN_MS = 5000L
+    private val isDetecting = AtomicBoolean(false)
 
     // ══════════════════════════════════════════════════════════════════════════
     // onCreate
@@ -97,9 +103,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        tvAccTal   = findViewById(R.id.tvAccTal)
-        tvStatus   = findViewById(R.id.tvStatus)
-        btnRecord  = findViewById(R.id.btnRecord)
+        tvAccTal    = findViewById(R.id.tvAccTal)
+        tvStatus    = findViewById(R.id.tvStatus)
+        btnRecord   = findViewById(R.id.btnRecord)
         overlayView = findViewById(R.id.overlayView)
 
         val infoPanel = findViewById<android.widget.LinearLayout>(R.id.infoPanel)
@@ -119,7 +125,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         btnRecord.setOnClickListener { captureVideo() }
 
-        // 点击状态栏手动拉取GPS缓存
         tvStatus.setOnClickListener {
             val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
             try {
@@ -149,7 +154,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val listener = object : LocationListener {
             override fun onLocationChanged(location: Location) {
                 lastLocationText = "${location.latitude},${location.longitude}"
-                Log.d("GPS_DEBUG", "坐标更新: $lastLocationText")
                 if (isRecording) {
                     try {
                         currentFileGpsWriter?.write("$lastLocationText\n")
@@ -167,7 +171,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 == PackageManager.PERMISSION_GRANTED) {
                 locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER,     1000L, 0f, listener)
                 locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 1000L, 0f, listener)
-                Log.d("GPS_DEBUG", "定位监听已成功启动")
             }
         } catch (e: Exception) {
             Log.e("GPS_ERROR", "启动失败: ${e.message}")
@@ -199,75 +202,78 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 .build()
 
             imageAnalyzer.setAnalyzer(ContextCompat.getMainExecutor(this)) { imageProxy ->
-                // 立刻把 ImageProxy 转成 Bitmap 并关闭，避免资源泄露
+                // 【修改】toRotatedBitmap() 放到 close() 之前，旋转后宽高才是正确的
                 val bitmap = imageProxy.toRotatedBitmap()
-                val w = imageProxy.width
-                val h = imageProxy.height
                 imageProxy.close()
 
-                // 存入帧缓冲时，每帧都做一次深拷贝，确保缓冲里的 Bitmap 是独立的
+                // 【修改】旋转后宽高已互换，用 bitmap.width/height 而不是 imageProxy.width/height
+                val w = bitmap.width
+                val h = bitmap.height
+
+                // 始终更新最新帧尺寸，供推理完成后的UI更新使用
+                latestFrameWidth  = w
+                latestFrameHeight = h
+
+                // 存入帧缓冲
                 val safeCopy = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
                 frameBuffer.add(safeCopy)
                 if (frameBuffer.size > 60) frameBuffer.removeAt(0)
 
                 // ── 通道B：录制中实时推理 ──────────────────────────────────
                 val now = System.currentTimeMillis()
-                if (isRecording && now - lastRealtimeDetectMs > REALTIME_INTERVAL_MS) {
-                    if (isDetecting.compareAndSet(false, true)) {
-                        lastRealtimeDetectMs = now
-                        // 推理用的帧再做一次独立拷贝，和 frameBuffer 里的完全隔离
-                        val inferBitmap =
-                            bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
-                        val imuNow = imuBuffer.lastOrNull() ?: ""
-                        val gpsNow = lastLocationText
-                        Thread {
-                            try {
-                                val results = detector.detect(inferBitmap)
-                                // 去重：每类只保留置信度最高的一个，最多显示3个
-                                val filtered = results
-                                    .filter { it.confidence > 0.35f }
-                                    .groupBy { it.label }
-                                    .map { (_, list) -> list.maxByOrNull { it.confidence }!! }
-                                    .sortedByDescending { it.confidence }
-                                    .take(3)
+                if (isRecording && now - lastRealtimeDetectMs > REALTIME_INTERVAL_MS
+                    && isDetecting.compareAndSet(false, true)) {
 
-                                runOnUiThread {
-                                    overlayView.detections = filtered
-                                    overlayView.frameWidth = w
-                                    overlayView.frameHeight = h
-                                    overlayView.invalidate()
-                                }
+                    lastRealtimeDetectMs = now
+                    // 推理帧独立拷贝
+                    val inferBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                    val imuNow = imuBuffer.lastOrNull() ?: ""
+                    val gpsNow = lastLocationText
 
-                                if (filtered.isNotEmpty() &&
-                                    System.currentTimeMillis() - lastChannelBSaveMs > CHANNEL_B_COOLDOWN_MS
-                                ) {
-                                    lastChannelBSaveMs = System.currentTimeMillis()
-                                    saveChannelBEvent(filtered, imuNow, gpsNow, inferBitmap)
-                                    Log.d(
-                                        "YOLO_B",
-                                        "通道B保存: ${filtered.map { "${it.label}(${"%.2f".format(it.confidence)})" }}"
-                                    )
-                                }
-                            } catch (e: Exception) {
-                                Log.e("YOLO_B", "通道B推理失败: ${e.message}")
-                            } finally {
-                                isDetecting.set(false)
+                    Thread {
+                        try {
+                            val results = detector.detect(inferBitmap)
+                            val filtered = results
+                                .filter { it.confidence > 0.35f }
+                                .groupBy { it.label }
+                                .map { (_, list) -> list.maxByOrNull { it.confidence }!! }
+                                .sortedByDescending { it.confidence }
+                                .take(3)
+
+                            runOnUiThread {
+                                overlayView.detections  = filtered
+                                // 【修改】用最新帧尺寸，不是推理帧尺寸，避免框位置滞后
+                                overlayView.frameWidth  = latestFrameWidth
+                                overlayView.frameHeight = latestFrameHeight
+                                overlayView.invalidate()
                             }
-                        }.start()
-                    }
+
+                            if (filtered.isNotEmpty() &&
+                                System.currentTimeMillis() - lastChannelBSaveMs > CHANNEL_B_COOLDOWN_MS) {
+                                lastChannelBSaveMs = System.currentTimeMillis()
+                                saveChannelBEvent(filtered, imuNow, gpsNow, inferBitmap)
+                                Log.d("YOLO_B", "通道B保存: ${filtered.map { "${it.label}(${"%.2f".format(it.confidence)})" }}")
+                            }
+                        } catch (e: Exception) {
+                            Log.e("YOLO_B", "通道B推理失败: ${e.message}")
+                        } finally {
+                            isDetecting.set(false)
+                        }
+                    }.start()
                 }
             }
 
             try {
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview, videoCapture, imageAnalyzer)
+                cameraProvider.bindToLifecycle(
+                    this, CameraSelector.DEFAULT_BACK_CAMERA,
+                    preview, videoCapture, imageAnalyzer
+                )
             } catch (e: Exception) {
                 Log.e("CameraX", "绑定失败", e)
             }
         }, ContextCompat.getMainExecutor(this))
     }
-
 
     // ══════════════════════════════════════════════════════════════════════════
     // 录制控制
@@ -315,7 +321,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         btnRecord.text       = "录制"
                         isRecording          = false
 
-                        // 停止录制时清空检测框
                         runOnUiThread {
                             overlayView.detections = emptyList()
                             overlayView.invalidate()
@@ -343,31 +348,27 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val eventDir = File(getExternalFilesDir(null), "RoadDataCapture/Event_$ts")
         if (!eventDir.exists()) eventDir.mkdirs()
 
-        // IMU片段
         File(eventDir, "event_imu.txt").bufferedWriter().use { out ->
             imuSnapshot.forEach { out.write("$it\n") }
         }
 
-        // 前2秒图片（取缓冲最早的4帧，即颠簸前画面）
+        // 【修改】只保存最近8帧而不是全部60帧，大幅减少IO时间
         val frames = synchronized(frameBuffer) {
-            frameBuffer.takeLast(60).map { it.copy(it.config ?: Bitmap.Config.ARGB_8888, false) }
+            frameBuffer.takeLast(8).map { it.copy(it.config ?: Bitmap.Config.ARGB_8888, false) }
         }
         frames.forEachIndexed { i, bmp ->
             FileOutputStream(File(eventDir, "frame_$i.jpg")).use { out ->
-                bmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
             }
         }
 
-        // 事件GPS
         File(eventDir, "event_location.txt").writeText(gpsSnapshot)
 
-        // 追加全局索引
         val gpsFile = File(getExternalFilesDir(null), "RoadDataCapture/eventgps.txt")
         FileWriter(gpsFile, true).use {
             it.write("${SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(Date())}, $gpsSnapshot\n")
         }
 
-        // YOLO结果（含IMU融合预留字段）
         File(eventDir, "yolo_result.txt").bufferedWriter().use { out ->
             out.write("触发时间: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(Date())}\n")
             out.write("触发位置: $gpsSnapshot\n")
@@ -402,7 +403,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (!eventDir.exists()) eventDir.mkdirs()
 
         FileOutputStream(File(eventDir, "frame_0.jpg")).use { out ->
-            frame.compress(Bitmap.CompressFormat.JPEG, 90, out)
+            frame.compress(Bitmap.CompressFormat.JPEG, 85, out)
         }
 
         File(eventDir, "event_location.txt").writeText(gpsData)
@@ -457,37 +458,36 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 // ── 通道A：IMU颠簸触发 ────────────────────────────────────
                 if (isRecording) {
                     val now = System.currentTimeMillis()
-                    if (now - lastTriggerTime > COOL_DOWN_MS) {
+                    if (now - lastTriggerTime > COOL_DOWN_MS
+                        && isDetecting.compareAndSet(false, true)) {
                         lastTriggerTime = now
-                        // 快照：取当前帧缓冲（前2秒画面）和IMU/GPS
                         val frames = synchronized(frameBuffer) {
                             frameBuffer.map { it.copy(it.config ?: Bitmap.Config.ARGB_8888, false) }
                         }
                         val imuSnapshot = imuBuffer.toList()
                         val gpsSnapshot = lastLocationText
-                        if (isDetecting.compareAndSet(false, true)) {
-                            Thread {
-                                try {
-                                    val step = maxOf(1, frames.size / 8)
-                                    val sampled = frames.filterIndexed { i, _ -> i % step == 0 }
-                                    val allDetect = sampled.flatMap { bmp ->
-                                        try { detector.detect(bmp) } catch (e: Exception) { emptyList() }
-                                    }
-                                    val best = allDetect
-                                        .groupBy { it.label }
-                                        .map { (_, list) -> list.maxByOrNull { it.confidence }!! }
-                                        .sortedByDescending { it.confidence }
-                                        .take(5)
-                                    saveEventData(best, imuSnapshot, gpsSnapshot)
-                                    Log.d("YOLO_A", "通道A完成，检测到 ${best.size} 个病害")
-                                } catch (e: Exception) {
-                                    Log.e("YOLO_A", "通道A异常: ${e.message}")
-                                    saveEventData(emptyList(), imuSnapshot, gpsSnapshot)
-                                } finally {
-                                    isDetecting.set(false)
+
+                        Thread {
+                            try {
+                                val step = maxOf(1, frames.size / 8)
+                                val sampled = frames.filterIndexed { i, _ -> i % step == 0 }
+                                val allDetect = sampled.flatMap { bmp ->
+                                    try { detector.detect(bmp) } catch (e: Exception) { emptyList() }
                                 }
-                            }.start()
-                        }
+                                val best = allDetect
+                                    .groupBy { it.label }
+                                    .map { (_, list) -> list.maxByOrNull { it.confidence }!! }
+                                    .sortedByDescending { it.confidence }
+                                    .take(5)
+                                saveEventData(best, imuSnapshot, gpsSnapshot)
+                                Log.d("YOLO_A", "通道A完成，检测到 ${best.size} 个病害")
+                            } catch (e: Exception) {
+                                Log.e("YOLO_A", "通道A异常: ${e.message}")
+                                saveEventData(emptyList(), imuSnapshot, gpsSnapshot)
+                            } finally {
+                                isDetecting.set(false)
+                            }
+                        }.start()
                     }
                 }
             } else {
@@ -495,7 +495,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             }
         }
 
-        // 全局IMU文件写入
         if (isRecording) {
             try {
                 imuFileWriter?.write("$line\n")
@@ -508,37 +507,53 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // ══════════════════════════════════════════════════════════════════════════
     // 工具函数
     // ══════════════════════════════════════════════════════════════════════════
-    // ✅ 正确写法
+    /**
+     * 将 ImageProxy 转为正确方向的 Bitmap。
+     *
+     * 关键修复：逐行拷贝 Y/U/V plane，跳过行间 padding，
+     * 避免 buffer.remaining() 包含 padding 字节导致图像损坏。
+     * 旋转固定 90°（Redmi K30 后置竖屏）。
+     */
     private fun ImageProxy.toRotatedBitmap(): Bitmap {
-        Log.d("YOLO_ROTATE", "自定义toBitmap被调用")
-
         val yPlane = planes[0]
         val uPlane = planes[1]
         val vPlane = planes[2]
 
-        val ySize = yPlane.buffer.remaining()
-        val uSize = uPlane.buffer.remaining()
-        val vSize = vPlane.buffer.remaining()
+        val yRowStride    = yPlane.rowStride
+        val uvRowStride   = uPlane.rowStride
+        val uvPixelStride = uPlane.pixelStride  // 通常为 2（interleaved）
 
-        val nv21 = ByteArray(ySize + uSize + vSize)
-        yPlane.buffer.get(nv21, 0, ySize)
-        // NV21 = Y plane + V plane + U plane（注意顺序是V在前U在后）
-        // 但更安全的做法是直接用 Matrix 旋转 + YuvToRgbConverter
-        // 简单可靠的替代方案：
-        vPlane.buffer.get(nv21, ySize, vSize)
-        uPlane.buffer.get(nv21, ySize + vSize, uSize)
+        val w = width
+        val h = height
+        val nv21 = ByteArray(w * h * 3 / 2)
 
-        val yuv = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        // 逐行拷贝 Y plane，跳过行尾 padding
+        val yBuf = yPlane.buffer
+        for (row in 0 until h) {
+            yBuf.position(row * yRowStride)
+            yBuf.get(nv21, row * w, w)
+        }
+
+        // 逐像素拷贝 UV plane（NV21：V在前U在后，交错排列）
+        val vBuf = vPlane.buffer
+        val uBuf = uPlane.buffer
+        var uvIndex = w * h
+        for (row in 0 until h / 2) {
+            for (col in 0 until w / 2) {
+                val pos = row * uvRowStride + col * uvPixelStride
+                nv21[uvIndex++] = vBuf.get(pos)
+                nv21[uvIndex++] = uBuf.get(pos)
+            }
+        }
+
+        val yuv = YuvImage(nv21, ImageFormat.NV21, w, h, null)
         val out = ByteArrayOutputStream()
-        yuv.compressToJpeg(Rect(0, 0, width, height), 100, out)
+        yuv.compressToJpeg(Rect(0, 0, w, h), 95, out)
         val decoded = BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
 
-        // 强制旋转90度（后置摄像头竖屏固定是90度）
-        val matrix = Matrix()
-        matrix.postRotate(90f)
-        val rotated = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
-        Log.d("YOLO_ROTATE", "旋转后尺寸: ${rotated.width} x ${rotated.height}")  // 加这行
-        return rotated
+        // 旋转 90°，旋转后宽高互换（原 w×h → 旋转后 h×w）
+        val matrix = Matrix().apply { postRotate(90f) }
+        return Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
     }
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
@@ -562,8 +577,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     override fun onResume() {
         super.onResume()
         val prefs = getSharedPreferences("config", Context.MODE_PRIVATE)
-        threshold      = prefs.getFloat("threshold", 3.0f)
-        imuFrequencyHz = prefs.getInt("frequency", 50)
+        threshold        = prefs.getFloat("threshold", 3.0f)
+        imuFrequencyHz   = prefs.getInt("frequency", 50)
         sampleIntervalMs = 1000L / imuFrequencyHz
 
         val newFps = prefs.getInt("video_fps", 30)
